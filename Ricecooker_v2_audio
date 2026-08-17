@@ -1,0 +1,373 @@
+import sounddevice as sd
+import numpy as np
+import time
+import math
+from scipy import signal
+
+class VoiceSynthesizer:
+    def __init__(self):
+        self.sample_rate = 44100
+        self.delay_samples = 44  # <1 sec feedback time
+        self.buffer = np.zeros(min(self.delay_samples, 44100))  # Buffer for delay
+        self.index = 0
+        self.running = True
+        
+        # Voice effect parameters
+        self.effect_type = "normal"  # normal, robot, chipmunk, demon, alien, underwater, whisper
+        self.pitch_shift = 0  # semitones
+        self.formant_shift = 0  # for changing voice character
+        self.vibrato_rate = 0  # Hz
+        self.vibrato_depth = 0  # semitones
+        self.tremolo_rate = 0  # Hz
+        self.tremolo_depth = 0  # amplitude modulation
+        
+        # Effect-specific buffers
+        self.phase = 0
+        self.lfo_phase = 0
+        
+    def apply_effect(self, audio):
+        """Apply selected voice effect"""
+        
+        if self.effect_type == "normal":
+            return self.apply_delay(audio)
+        
+        elif self.effect_type == "robot":
+            return self.robot_voice(audio)
+        
+        elif self.effect_type == "chipmunk":
+            return self.chipmunk_voice(audio)
+        
+        elif self.effect_type == "demon":
+            return self.demon_voice(audio)
+        
+        elif self.effect_type == "alien":
+            return self.alien_voice(audio)
+        
+        elif self.effect_type == "underwater":
+            return self.underwater_voice(audio)
+        
+        elif self.effect_type == "whisper":
+            return self.whisper_voice(audio)
+        
+        elif self.effect_type == "echo_chamber":
+            return self.echo_chamber_voice(audio)
+        
+        elif self.effect_type == "telephone":
+            return self.telephone_voice(audio)
+        
+        else:
+            return self.apply_delay(audio)
+    
+    def apply_delay(self, audio):
+        """Original delay effect"""
+        output = np.zeros_like(audio)
+        for i in range(len(audio)):
+            output[i] = self.buffer[self.index % len(self.buffer)] * 0.5
+            self.buffer[self.index % len(self.buffer)] = audio[i] * 0.7
+            self.index += 1
+        return output
+    
+    def pitch_shift_audio(self, audio, semitones):
+        """Pitch shift using resampling"""
+        if abs(semitones) < 0.01:
+            return audio
+        
+        ratio = 2 ** (semitones / 12)
+        new_length = int(len(audio) / ratio)
+        
+        # Resample
+        resampled = signal.resample(audio, new_length)
+        
+        # Trim or pad
+        if len(resampled) > len(audio):
+            return resampled[:len(audio)]
+        else:
+            return np.pad(resampled, (0, len(audio) - len(resampled)), 'constant')
+    
+    def robot_voice(self, audio):
+        """Robot voice: pitch + square wave modulation + bitcrush"""
+        # Pitch up slightly
+        audio = self.pitch_shift_audio(audio, 2)
+        
+        # Add ring modulation (square wave)
+        ring_mod = np.sign(np.sin(2 * np.pi * 80 * np.arange(len(audio)) / self.sample_rate))
+        audio = audio * ring_mod * 0.7 + audio * 0.3
+        
+        # Bitcrush effect (simple quantization)
+        audio = np.round(audio * 16) / 16
+        
+        # Add delay
+        return self.apply_delay(audio)
+    
+    def chipmunk_voice(self, audio):
+        """Chipmunk: high pitch + fast vibrato"""
+        audio = self.pitch_shift_audio(audio, 8)  # High pitch
+        
+        # Add vibrato
+        vibrato = 1 + 0.05 * np.sin(2 * np.pi * 6 * np.arange(len(audio)) / self.sample_rate)
+        audio = audio * vibrato
+        
+        return self.apply_delay(audio)
+    
+    def demon_voice(self, audio):
+        """Demon: low pitch + distortion + growl"""
+        # Pitch down
+        audio = self.pitch_shift_audio(audio, -7)
+        
+        # Add distortion (clipping)
+        audio = np.tanh(audio * 3) / 1.5
+        
+        # Add growl (low frequency modulation)
+        growl = 1 + 0.3 * np.sin(2 * np.pi * 30 * np.arange(len(audio)) / self.sample_rate)
+        audio = audio * growl
+        
+        # Reverb-like delay
+        audio = self.apply_delay(audio)
+        
+        return audio
+    
+    def alien_voice(self, audio):
+        """Alien: pitch + flange + ring modulation"""
+        # Moderate pitch shift
+        audio = self.pitch_shift_audio(audio, 4)
+        
+        # Flanger effect
+        delay_samples = int(0.005 * self.sample_rate)  # 5ms
+        flanger = np.zeros_like(audio)
+        for i in range(len(audio)):
+            mod = int(delay_samples * (1 + 0.5 * np.sin(2 * np.pi * 2 * i / self.sample_rate)))
+            if i - mod >= 0:
+                flanger[i] = audio[i - mod]
+            else:
+                flanger[i] = audio[i]
+        
+        audio = audio * 0.5 + flanger * 0.5
+        
+        # Ring modulation
+        ring = np.sin(2 * np.pi * 200 * np.arange(len(audio)) / self.sample_rate)
+        audio = audio * (0.7 + 0.3 * ring)
+        
+        return self.apply_delay(audio)
+    
+    def underwater_voice(self, audio):
+        """Underwater: low-pass + chorus + slow modulation"""
+        # Low-pass filter
+        b, a = signal.butter(4, 800 / (self.sample_rate/2), btype='low')
+        audio = signal.filtfilt(b, a, audio)
+        
+        # Chorus effect
+        chorus_delay = int(0.02 * self.sample_rate)
+        chorus = np.zeros_like(audio)
+        for i in range(len(audio)):
+            mod = int(chorus_delay * (1 + 0.3 * np.sin(2 * np.pi * 1.5 * i / self.sample_rate)))
+            if i - mod >= 0:
+                chorus[i] = audio[i - mod]
+        
+        audio = audio * 0.6 + chorus * 0.4
+        
+        # Slow amplitude modulation
+        tremolo = 1 + 0.2 * np.sin(2 * np.pi * 2 * np.arange(len(audio)) / self.sample_rate)
+        audio = audio * tremolo
+        
+        return self.apply_delay(audio)
+    
+    def whisper_voice(self, audio):
+        """Whisper: noise mixing + high-pass + soft"""
+        # High-pass filter (remove bass)
+        b, a = signal.butter(4, 800 / (self.sample_rate/2), btype='high')
+        audio = signal.filtfilt(b, a, audio)
+        
+        # Add noise
+        noise = np.random.normal(0, 0.02, len(audio))
+        audio = audio + noise
+        
+        # Reduce volume
+        audio = audio * 0.6
+        
+        # Soft clipping
+        audio = np.tanh(audio * 2)
+        
+        return self.apply_delay(audio)
+    
+    def echo_chamber_voice(self, audio):
+        """Echo chamber: long delay + reverb"""
+        # Long delay
+        long_delay = int(0.3 * self.sample_rate)
+        echo = np.zeros_like(audio)
+        for i in range(len(audio)):
+            if i >= long_delay:
+                echo[i] = self.buffer[(self.index - long_delay) % len(self.buffer)] * 0.5
+            self.buffer[self.index % len(self.buffer)] = audio[i] + self.buffer[(self.index - long_delay) % len(self.buffer)] * 0.3
+            self.index += 1
+        
+        audio = audio * 0.5 + echo * 0.5
+        
+        # Add reverb
+        reverb_ir = np.exp(-np.arange(500) / 100) * 0.3
+        reverb = np.convolve(audio, reverb_ir, mode='same')
+        audio = audio * 0.6 + reverb * 0.4
+        
+        return audio
+    
+    def telephone_voice(self, audio):
+        """Telephone: band-pass + distortion"""
+        # Band-pass filter (300Hz - 3.4kHz)
+        b, a = signal.butter(4, [300 / (self.sample_rate/2), 3400 / (self.sample_rate/2)], btype='band')
+        audio = signal.filtfilt(b, a, audio)
+        
+        # Slight distortion
+        audio = np.tanh(audio * 1.5)
+        
+        # Add some noise
+        audio = audio + np.random.normal(0, 0.005, len(audio))
+        
+        return self.apply_delay(audio)
+    
+    def callback(self, indata, outdata, frames, time_info, status):
+        audio = indata[:, 0]
+        
+        # Apply selected effect
+        processed = self.apply_effect(audio)
+        
+        # Normalize to prevent clipping
+        max_val = np.max(np.abs(processed))
+        if max_val > 1.0:
+            processed = processed / max_val * 0.9
+        
+        outdata[:, 0] = processed
+    
+    def show_menu(self):
+        """Display voice effects menu"""
+        print("\n" + "=" * 50)
+        print("VOICE EFFECTS MENU")
+        print("=" * 50)
+        print(f"Current effect: {self.effect_type.upper()}")
+        print("-" * 50)
+        print("1. Normal (delay only)")
+        print("2. Robot Voice")
+        print("3. Chipmunk (high pitch)")
+        print("4. Demon (low pitch)")
+        print("5. Alien (space voice)")
+        print("6. Underwater")
+        print("7. Whisper")
+        print("8. Echo Chamber")
+        print("9. Telephone")
+        print("0. Exit")
+        print("=" * 50)
+        print("Additional controls:")
+        print("d - Adjust delay (1-1000ms)")
+        print("v - Adjust volume (1-10)")
+        print("p - Pitch shift (-12 to +12 semitones)")
+        print("=" * 50)
+    
+    def adjust_delay(self):
+        """Adjust delay time"""
+        try:
+            ms = float(input("Enter delay in milliseconds (1-1000): "))
+            ms = max(1, min(1000, ms))
+            self.delay_samples = int(ms * self.sample_rate / 1000)
+            self.buffer = np.zeros(max(self.delay_samples, 44100))
+            print(f"✓ Delay set to {ms}ms")
+        except ValueError:
+            print("Invalid input")
+    
+    def adjust_volume(self):
+        """Adjust volume"""
+        try:
+            vol = float(input("Enter volume (1-10): "))
+            vol = max(1, min(10, vol))
+            self.volume = vol / 10
+            print(f"✓ Volume set to {vol}")
+        except ValueError:
+            print("Invalid input")
+    
+    def adjust_pitch(self):
+        """Adjust pitch shift"""
+        try:
+            semitones = float(input("Enter pitch shift (-12 to +12 semitones): "))
+            semitones = max(-12, min(12, semitones))
+            self.pitch_shift = semitones
+            print(f"✓ Pitch shift set to {semitones} semitones")
+        except ValueError:
+            print("Invalid input")
+    
+    def run(self):
+        print("\n" + "=" * 50)
+        print("🎤 VOICE SYNTHESIZER & EFFECTS")
+        print("=" * 50)
+        print("\nSpeak into your microphone to hear the effects!")
+        print("Press Ctrl+C at any time to stop\n")
+        
+        with sd.Stream(callback=self.callback, channels=1, samplerate=self.sample_rate):
+            while self.running:
+                try:
+                    self.show_menu()
+                    choice = input("\nEnter choice: ").strip().lower()
+                    
+                    if choice == '0':
+                        self.running = False
+                        break
+                    
+                    elif choice == '1':
+                        self.effect_type = "normal"
+                        print("✓ Normal mode (delay only)")
+                    
+                    elif choice == '2':
+                        self.effect_type = "robot"
+                        print("✓ Robot mode activated! 🤖")
+                    
+                    elif choice == '3':
+                        self.effect_type = "chipmunk"
+                        print("✓ Chipmunk mode! 🐿️")
+                    
+                    elif choice == '4':
+                        self.effect_type = "demon"
+                        print("✓ Demon mode! 👹")
+                    
+                    elif choice == '5':
+                        self.effect_type = "alien"
+                        print("✓ Alien mode! 👽")
+                    
+                    elif choice == '6':
+                        self.effect_type = "underwater"
+                        print("✓ Underwater mode! 🌊")
+                    
+                    elif choice == '7':
+                        self.effect_type = "whisper"
+                        print("✓ Whisper mode! 🤫")
+                    
+                    elif choice == '8':
+                        self.effect_type = "echo_chamber"
+                        print("✓ Echo Chamber mode! 🎵")
+                    
+                    elif choice == '9':
+                        self.effect_type = "telephone"
+                        print("✓ Telephone mode! 📞")
+                    
+                    elif choice == 'd':
+                        self.adjust_delay()
+                    
+                    elif choice == 'v':
+                        self.adjust_volume()
+                    
+                    elif choice == 'p':
+                        self.adjust_pitch()
+                    
+                    else:
+                        print("Invalid choice. Please try again.")
+                    
+                    time.sleep(0.1)
+                    
+                except KeyboardInterrupt:
+                    self.running = False
+                    break
+                except Exception as e:
+                    print(f"Error: {e}")
+
+if __name__ == "__main__":
+    synthesizer = VoiceSynthesizer()
+    try:
+        synthesizer.run()
+    except KeyboardInterrupt:
+        print("\n\nStopping voice synthesizer...")
+    print("Goodbye!")
