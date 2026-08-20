@@ -1,0 +1,263 @@
+"""
+Ricecooker - Visual Feedback Trainer
+Movement Training Tool
+=========================
+
+Plays back your webcam feed after a delay D (seconds) at playback speed P
+(1.0 = real-time, <1.0 = slow motion, >1.0 = fast forward), so you can watch
+your own movement with a beat of delay and at a pace where fine detail is
+easier to notice.
+
+Both D and P can be changed *while the program is running*, either with the
+on-screen sliders or with keyboard shortcuts.
+
+Controls
+--------
+  [ / ]   decrease / increase delay by 0.1s
+  { / }   decrease / increase delay by 1.0s
+  - / =   decrease / increase speed by 0.05x
+  _ / +   decrease / increase speed by 0.25x
+  m       toggle mirror flip (horizontal)
+  p       pause / resume playback (capture keeps running)
+  r       reset delay & speed to the startup values
+  q / Esc quit
+
+Install dependency:
+    pip install opencv-python
+
+Run:
+    python delayed_mirror.py --delay 2.0 --speed 0.5
+"""
+
+import argparse
+import bisect
+import threading
+import time
+from collections import deque
+
+import cv2
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Delayed / slow-motion self-view for movement training.")
+    p.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    p.add_argument("--delay", type=float, default=2.0, help="Initial delay D in seconds (default: 2.0)")
+    p.add_argument("--speed", type=float, default=0.5, help="Initial playback speed P, 1.0=real-time (default: 0.5)")
+    p.add_argument("--buffer", type=float, default=30.0,
+                   help="Max seconds of video to keep buffered — must be able to cover D "
+                        "plus slow-motion catch-up (default: 30.0)")
+    p.add_argument("--width", type=int, default=640, help="Capture width (default: 640)")
+    p.add_argument("--height", type=int, default=480, help="Capture height (default: 480)")
+    p.add_argument("--mirror", action="store_true", help="Start with horizontal mirror flip on")
+    return p.parse_args()
+
+
+class FrameBuffer:
+    """Thread-safe rolling buffer of (timestamp, frame)."""
+
+    def __init__(self, max_seconds):
+        self.max_seconds = max_seconds
+        self.buf = deque()
+        self.lock = threading.Lock()
+
+    def add(self, ts, frame):
+        with self.lock:
+            self.buf.append((ts, frame))
+            while self.buf and (ts - self.buf[0][0]) > self.max_seconds:
+                self.buf.popleft()
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.buf)
+
+    def set_max_seconds(self, seconds):
+        with self.lock:
+            self.max_seconds = seconds
+
+
+def find_closest(snapshot, target_ts):
+    """Binary-search snapshot (sorted by timestamp) for the frame nearest target_ts."""
+    if not snapshot:
+        return None
+    timestamps = [t for t, _ in snapshot]
+    idx = bisect.bisect_left(timestamps, target_ts)
+    if idx <= 0:
+        return snapshot[0]
+    if idx >= len(snapshot):
+        return snapshot[-1]
+    before = snapshot[idx - 1]
+    after = snapshot[idx]
+    if (target_ts - before[0]) <= (after[0] - target_ts):
+        return before
+    return after
+
+
+def capture_loop(cap, frame_buffer, stop_event):
+    while not stop_event.is_set():
+        ok, frame = cap.read()
+        if not ok:
+            time.sleep(0.005)
+            continue
+        frame_buffer.add(time.time(), frame)
+
+
+def nothing(_):
+    pass
+
+
+def main():
+    args = parse_args()
+
+    cap = cv2.VideoCapture(args.camera)
+    if args.width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    if args.height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    if not cap.isOpened():
+        print(f"ERROR: could not open camera index {args.camera}")
+        return
+
+    # Shared adjustable state
+    state = {
+        "delay": max(0.0, args.delay),
+        "speed": max(0.05, args.speed),
+        "mirror": args.mirror,
+        "paused": False,
+    }
+    defaults = {"delay": state["delay"], "speed": state["speed"]}
+
+    buffer_seconds = max(args.buffer, state["delay"] + 5.0)
+    frame_buffer = FrameBuffer(buffer_seconds)
+
+    stop_event = threading.Event()
+    cap_thread = threading.Thread(target=capture_loop, args=(cap, frame_buffer, stop_event), daemon=True)
+    cap_thread.start()
+
+    window = "Delayed Movement Trainer"
+    cv2.namedWindow(window)
+
+    # Trackbars: delay in 0.1s steps (0-30s), speed in 0.01x steps (0.05x-3.0x)
+    DELAY_MAX_STEPS = 300   # -> 30.0s
+    SPEED_MIN_STEPS = 5     # -> 0.05x
+    SPEED_MAX_STEPS = 300   # -> 3.00x
+
+    cv2.createTrackbar("Delay x0.1s", window, int(round(state["delay"] * 10)), DELAY_MAX_STEPS, nothing)
+    cv2.createTrackbar("Speed x0.01", window, int(round(state["speed"] * 100)), SPEED_MAX_STEPS, nothing)
+    cv2.setTrackbarMin("Speed x0.01", window, SPEED_MIN_STEPS)
+
+    # Wait for the buffer to have at least one frame before starting playback loop
+    while not frame_buffer.snapshot():
+        time.sleep(0.01)
+        if stop_event.is_set():
+            return
+
+    now0 = time.time()
+    playback_time = now0 - state["delay"]
+    last_loop = now0
+
+    print("Delayed Movement Trainer running. Focus the video window and use keys or sliders to adjust.")
+    print("Press 'q' or Esc to quit.")
+
+    try:
+        while True:
+            now = time.time()
+            dt_real = now - last_loop
+            last_loop = now
+
+            # --- read trackbars (lets user drag sliders live) ---
+            tb_delay = cv2.getTrackbarPos("Delay x0.1s", window) / 10.0
+            tb_speed = max(cv2.getTrackbarPos("Speed x0.01", window), SPEED_MIN_STEPS) / 100.0
+            state["delay"] = tb_delay
+            state["speed"] = tb_speed
+
+            # grow buffer capacity if user asks for a bigger delay than currently allocated
+            needed = state["delay"] + 5.0
+            if needed > frame_buffer.max_seconds:
+                frame_buffer.set_max_seconds(needed)
+
+            if not state["paused"]:
+                playback_time += dt_real * state["speed"]
+
+            snapshot = frame_buffer.snapshot()
+            if not snapshot:
+                continue
+
+            oldest_ts = snapshot[0][0]
+            newest_ts = snapshot[-1][0]
+            target_min = oldest_ts
+            target_max = max(oldest_ts, newest_ts - state["delay"])
+
+            playback_time = min(max(playback_time, target_min), target_max)
+
+            result = find_closest(snapshot, playback_time)
+            if result is None:
+                continue
+            frame_ts, frame = result
+            frame = frame.copy()
+
+            if state["mirror"]:
+                frame = cv2.flip(frame, 1)
+
+            actual_delay = now - frame_ts
+            overlay_lines = [
+                f"Delay D: {state['delay']:.1f}s (actual ~{actual_delay:.1f}s)",
+                f"Speed P: {state['speed']:.2f}x",
+                f"Buffer: {frame_buffer.max_seconds:.0f}s cap, {newest_ts - oldest_ts:.1f}s filled",
+                "PAUSED" if state["paused"] else "",
+            ]
+            y = 25
+            for line in overlay_lines:
+                if not line:
+                    continue
+                cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+                y += 25
+
+            cv2.putText(frame, "[ ] delay  - = speed  m mirror  p pause  r reset  q quit",
+                        (10, frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, "[ ] delay  - = speed  m mirror  p pause  r reset  q quit",
+                        (10, frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+            cv2.imshow(window, frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 27):  # q or Esc
+                break
+            elif key == ord('['):
+                state["delay"] = max(0.0, state["delay"] - 0.1)
+            elif key == ord(']'):
+                state["delay"] = min(DELAY_MAX_STEPS / 10.0, state["delay"] + 0.1)
+            elif key == ord('{'):
+                state["delay"] = max(0.0, state["delay"] - 1.0)
+            elif key == ord('}'):
+                state["delay"] = min(DELAY_MAX_STEPS / 10.0, state["delay"] + 1.0)
+            elif key == ord('-'):
+                state["speed"] = max(SPEED_MIN_STEPS / 100.0, state["speed"] - 0.05)
+            elif key == ord('='):
+                state["speed"] = min(SPEED_MAX_STEPS / 100.0, state["speed"] + 0.05)
+            elif key == ord('_'):
+                state["speed"] = max(SPEED_MIN_STEPS / 100.0, state["speed"] - 0.25)
+            elif key == ord('+'):
+                state["speed"] = min(SPEED_MAX_STEPS / 100.0, state["speed"] + 0.25)
+            elif key == ord('m'):
+                state["mirror"] = not state["mirror"]
+            elif key == ord('p'):
+                state["paused"] = not state["paused"]
+            elif key == ord('r'):
+                state["delay"] = defaults["delay"]
+                state["speed"] = defaults["speed"]
+
+            # push any keyboard-driven changes back onto the trackbars so slider stays in sync
+            cv2.setTrackbarPos("Delay x0.1s", window, int(round(state["delay"] * 10)))
+            cv2.setTrackbarPos("Speed x0.01", window, int(round(state["speed"] * 100)))
+
+    finally:
+        stop_event.set()
+        cap_thread.join(timeout=1.0)
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
